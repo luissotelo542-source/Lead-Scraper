@@ -43,8 +43,10 @@ UI_FONT = "Helvetica Neue"
 CATEGORY_MAP = {
     "plumber":        [("craft", "plumber"), ("shop", "plumber")],
     "electrician":    [("craft", "electrician")],
-    "landscaper":     [("craft", "gardener"), ("craft", "landscape")],
-    "landscaping":    [("craft", "gardener"), ("craft", "landscape")],
+    "landscaper":     [("craft", "gardener"), ("craft", "landscape"),
+                       ("shop", "garden_centre"), ("shop", "lawn_care")],
+    "landscaping":    [("craft", "gardener"), ("craft", "landscape"),
+                       ("shop", "garden_centre"), ("shop", "lawn_care")],
     "junk removal":   [("shop", "junk_removal")],
     "painter":        [("craft", "painter")],
     "roofer":         [("craft", "roofer"), ("craft", "roofing")],
@@ -197,33 +199,41 @@ def run_overpass_query(query):
 # DATA EXTRACTION & QUALITY SCORING
 # ══════════════════════════════════════════════════════════════════════════════
 
+# A proper business-type tag. Any ONE of these is enough to count an element
+# as a real business — even with no phone, email, or address. These are exactly
+# the no-online-presence small contractors we most want as leads.
+BUSINESS_KEYS = {"craft", "shop", "office", "company", "trade"}
+
+
 def is_real_business(tags):
     """
-    Return True only if the OSM element looks like an actual business, not a
-    geographic/recreational feature.
+    EXCLUSION filter — keep everything EXCEPT clear non-business features.
 
-    Rules (applied in order):
-    1. Any of the JUNK_KEYS present → discard (park, leisure, natural, etc.)
-    2. amenity present but its value is in JUNK_AMENITY_VALUES → discard
-    3. Must have at least one "business signal":
-       - a phone/email/address field, OR
-       - tagged under craft/shop/office (these are business-specific keys)
-       A result with name only and zero signals is probably a landmark.
+    1. Block geographic / recreational features outright: any JUNK_KEYS
+       (leisure, landuse, natural, golf, sport, highway, waterway, boundary,
+       place, tourism, …) or a junk amenity value (park, bench, parking, …).
+    2. Otherwise PASS as long as the element carries a real business-type tag
+       (craft / shop / office / company / trade) — or a non-junk amenity such
+       as restaurant/cafe. No phone, email, or address is required: a
+       business-type tag alone is sufficient.
+    3. Only when there is NO business-type tag at all (a bare name with nothing
+       else) do we fall back to requiring a contact signal; if it has none, it
+       is almost certainly a landmark and gets filtered.
     """
-    # Rule 1 — junk top-level keys
+    # 1 — block junk geographic/recreational keys
     for jk in JUNK_KEYS:
         if jk in tags:
             return False
 
-    # Rule 2 — junk amenity values
-    amenity = tags.get("amenity", "")
+    amenity = tags.get("amenity", "").strip()
     if amenity and amenity in JUNK_AMENITY_VALUES:
         return False
 
-    # Rule 3 — need at least one business signal
-    business_keys = {"craft", "shop", "office"}
-    has_business_key = any(k in tags for k in business_keys)
+    # 2 — a business-type tag (or a surviving non-junk amenity) is enough alone
+    if amenity or any(k in tags for k in BUSINESS_KEYS):
+        return True
 
+    # 3 — no business tag: keep only if there's a real contact signal
     contact_fields = [
         "phone", "contact:phone", "mobile", "contact:mobile", "telephone",
         "email", "contact:email",
@@ -231,9 +241,7 @@ def is_real_business(tags):
         "facebook", "contact:facebook", "instagram", "contact:instagram",
         "opening_hours",
     ]
-    has_contact = any(tags.get(f, "").strip() for f in contact_fields)
-
-    return has_business_key or has_contact
+    return any(tags.get(f, "").strip() for f in contact_fields)
 
 
 def has_website(tags):
