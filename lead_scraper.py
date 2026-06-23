@@ -28,8 +28,8 @@ GOLD_PRESS  = "#D9A300"
 WHITE       = "#FFFFFF"
 GRAY        = "#A0A0A0"
 DISABLED    = "#3A3A3A"
-GREEN_DARK  = "#1A3A1A"   # "strong lead" row tint
-AMBER_DARK  = "#2E2200"   # "sparse data" row tint
+GREEN_DARK  = "#1A3A1A"
+AMBER_DARK  = "#2E2200"
 
 UI_FONT = "Helvetica Neue"
 
@@ -37,9 +37,6 @@ UI_FONT = "Helvetica Neue"
 # ══════════════════════════════════════════════════════════════════════════════
 # CATEGORY → OSM TAG MAP
 # ══════════════════════════════════════════════════════════════════════════════
-# Only craft/shop/office/amenity keys that represent actual businesses.
-# "landuse", "leisure", "natural" keys were here before — removed because they
-# pull in parks, lawns, and geographic features rather than real companies.
 CATEGORY_MAP = {
     "plumber":        [("craft", "plumber"), ("shop", "plumber")],
     "electrician":    [("craft", "electrician")],
@@ -82,23 +79,52 @@ CATEGORY_MAP = {
     "storage":        [("shop", "storage_rental")],
 }
 
-# OSM keys that flag a geographic/recreational feature — not a business.
-# Any element carrying one of these will be excluded regardless of its name.
 JUNK_KEYS = {
     "leisure", "natural", "golf", "sport", "landuse",
     "boundary", "place", "highway", "waterway", "railway",
     "aeroway", "historic", "tourism",
 }
 
-# Subset of amenity values that are clearly NOT a sellable business
 JUNK_AMENITY_VALUES = {
     "park", "bench", "waste_basket", "recycling", "parking",
     "parking_space", "bicycle_parking", "shelter", "toilets",
     "drinking_water", "fountain", "playground", "bbq",
-    "waste_transfer_station",   # too generic — industrial, not contractor
+    "waste_transfer_station",
     "social_facility", "place_of_worship", "school", "college",
     "university", "hospital", "clinic", "library", "police",
     "fire_station", "post_office", "bus_station", "ferry_terminal",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DMV PRESET CITIES FOR BATCH SEARCH
+# ══════════════════════════════════════════════════════════════════════════════
+DMV_PRESETS = {
+    "MARYLAND": [
+        "Rockville, MD",
+        "Gaithersburg, MD",
+        "Silver Spring, MD",
+        "Bethesda, MD",
+        "Germantown, MD",
+        "Frederick, MD",
+        "Columbia, MD",
+        "Bowie, MD",
+        "Hyattsville, MD",
+        "Towson, MD",
+        "Glen Burnie, MD",
+        "Annapolis, MD",
+    ],
+    "VIRGINIA": [
+        "Arlington, VA",
+        "Alexandria, VA",
+        "Falls Church, VA",
+        "Fairfax, VA",
+        "Reston, VA",
+        "Herndon, VA",
+    ],
+    "DC": [
+        "Washington, DC",
+    ],
 }
 
 
@@ -199,28 +225,13 @@ def run_overpass_query(query):
 # DATA EXTRACTION & QUALITY SCORING
 # ══════════════════════════════════════════════════════════════════════════════
 
-# A proper business-type tag. Any ONE of these is enough to count an element
-# as a real business — even with no phone, email, or address. These are exactly
-# the no-online-presence small contractors we most want as leads.
 BUSINESS_KEYS = {"craft", "shop", "office", "company", "trade"}
 
 
 def is_real_business(tags):
     """
     EXCLUSION filter — keep everything EXCEPT clear non-business features.
-
-    1. Block geographic / recreational features outright: any JUNK_KEYS
-       (leisure, landuse, natural, golf, sport, highway, waterway, boundary,
-       place, tourism, …) or a junk amenity value (park, bench, parking, …).
-    2. Otherwise PASS as long as the element carries a real business-type tag
-       (craft / shop / office / company / trade) — or a non-junk amenity such
-       as restaurant/cafe. No phone, email, or address is required: a
-       business-type tag alone is sufficient.
-    3. Only when there is NO business-type tag at all (a bare name with nothing
-       else) do we fall back to requiring a contact signal; if it has none, it
-       is almost certainly a landmark and gets filtered.
     """
-    # 1 — block junk geographic/recreational keys
     for jk in JUNK_KEYS:
         if jk in tags:
             return False
@@ -229,11 +240,9 @@ def is_real_business(tags):
     if amenity and amenity in JUNK_AMENITY_VALUES:
         return False
 
-    # 2 — a business-type tag (or a surviving non-junk amenity) is enough alone
     if amenity or any(k in tags for k in BUSINESS_KEYS):
         return True
 
-    # 3 — no business tag: keep only if there's a real contact signal
     contact_fields = [
         "phone", "contact:phone", "mobile", "contact:mobile", "telephone",
         "email", "contact:email",
@@ -306,12 +315,10 @@ def extract_address(tags):
 
 def lead_quality(tags, social):
     """
-    Return a (score, label, tag_key) tuple used for sorting and display.
-
     score 3 — Strong lead  : has phone or address + social presence
     score 2 — Good lead    : has phone or address but no social
     score 1 — Verify first : social only (no phone/address)
-    score 0 — Sparse data  : nothing but a name — still shown, lowest priority
+    score 0 — Sparse data  : nothing but a name
     """
     phone   = get_phone(tags)
     address = extract_address(tags)
@@ -328,70 +335,101 @@ def lead_quality(tags, social):
     return (0, "Sparse data — verify manually", "sparse")
 
 
-def scrape_leads(category_input, area_input, callback):
+def _count_filled(lead):
+    """Count non-empty, non-dash fields for completeness comparison."""
+    return sum(1 for v in lead.values() if isinstance(v, str) and v not in ("—", ""))
+
+
+def scrape_leads(category_input, areas, callback, progress_callback=None):
+    """
+    Batch search across multiple areas.
+
+    areas             : list of area-name strings
+    callback          : called once when done — callback(leads, error_or_None)
+    progress_callback : called before each area — progress_callback(area, index, total)
+                        runs in the background thread; caller must route to main thread
+    """
     key  = category_input.strip().lower()
     tags = CATEGORY_MAP.get(key) or [("craft", key), ("shop", key), ("amenity", key)]
 
-    bbox = geocode_area(area_input.strip())
-    if not bbox:
-        callback([], f"Could not find the location: '{area_input}'\n\n"
-                     "Try being more specific, e.g. 'Rockville, MD' or 'Arlington, VA'.")
-        return
+    all_leads   = {}   # dedup_key → lead dict
+    skip_errors = []   # human-readable notes for areas that failed
 
-    query = build_overpass_query(tags, bbox)
-    try:
-        data = run_overpass_query(query)
-    except OverpassError as ex:
-        callback([], str(ex))
-        return
+    clean_areas = [a.strip() for a in areas if a.strip()]
+    total = len(clean_areas)
 
-    leads = []
-    seen_ids = set()
-    for element in data.get("elements", []):
-        elem_id = element.get("id")
-        if elem_id in seen_ids:
-            continue
-        seen_ids.add(elem_id)
+    for idx, area in enumerate(clean_areas):
+        if progress_callback:
+            progress_callback(area, idx + 1, total)
 
-        t = element.get("tags", {})
-        name = t.get("name", "").strip()
-        if not name:
-            continue
-        if has_website(t):
-            continue
-        if not is_real_business(t):
+        bbox = geocode_area(area)
+        if not bbox:
+            skip_errors.append(f"• Could not find location: '{area}'")
+            if idx < total - 1:
+                time.sleep(1.5)
             continue
 
-        phone   = get_phone(t)
-        email   = get_email(t)
-        address = extract_address(t)
-        social  = get_social(t)
-        hours   = get_opening_hours(t)
-        score, quality_label, qtag = lead_quality(t, social)
+        query = build_overpass_query(tags, bbox)
+        try:
+            data = run_overpass_query(query)
+        except OverpassError as ex:
+            skip_errors.append(f"• '{area}': {str(ex)[:200]}")
+            if idx < total - 1:
+                time.sleep(1.5)
+            continue
 
-        cat = (t.get("craft") or t.get("shop") or t.get("office") or
-               t.get("amenity") or category_input).replace("_", " ").title()
+        for element in data.get("elements", []):
+            t    = element.get("tags", {})
+            name = t.get("name", "").strip()
+            if not name or has_website(t) or not is_real_business(t):
+                continue
 
-        # city for browser searches
-        city_hint = t.get("addr:city", "") or area_input.strip()
+            # De-dup: prefer stable OSM type+id; fallback name+address
+            elem_id   = element.get("id")
+            elem_type = element.get("type", "node")
+            address   = extract_address(t)
+            dedup_key = (elem_type, elem_id) if elem_id is not None \
+                        else (name.lower(), address.lower())
 
-        leads.append({
-            "name":     name,
-            "phone":    phone    or "—",
-            "email":    email    or "—",
-            "address":  address  or "—",
-            "hours":    hours    or "—",
-            "category": cat,
-            "social":   social   or "—",
-            "quality":  quality_label,
-            "qtag":     qtag,
-            "score":    score,
-            "city_hint": city_hint,
-        })
+            phone   = get_phone(t)
+            email   = get_email(t)
+            social  = get_social(t)
+            hours   = get_opening_hours(t)
+            score, quality_label, qtag = lead_quality(t, social)
+            cat = (t.get("craft") or t.get("shop") or t.get("office") or
+                   t.get("amenity") or category_input).replace("_", " ").title()
+            city_hint = t.get("addr:city", "") or area
 
-    # Sort: best leads first
-    leads.sort(key=lambda x: x["score"], reverse=True)
-    callback(leads, None)
+            lead = {
+                "name":      name,
+                "phone":     phone   or "—",
+                "email":     email   or "—",
+                "address":   address or "—",
+                "hours":     hours   or "—",
+                "category":  cat,
+                "social":    social  or "—",
+                "quality":   quality_label,
+                "qtag":      qtag,
+                "score":     score,
+                "city_hint": city_hint,
+            }
+
+            if dedup_key not in all_leads:
+                all_leads[dedup_key] = lead
+            elif _count_filled(lead) > _count_filled(all_leads[dedup_key]):
+                all_leads[dedup_key] = lead
+
+        # Polite delay between requests — skip after the last area
+        if idx < total - 1:
+            time.sleep(1.5)
+
+    leads = sorted(all_leads.values(), key=lambda x: x["score"], reverse=True)
+
+    if not leads and skip_errors:
+        callback([], "Could not retrieve results for any area:\n\n" +
+                     "\n".join(skip_errors))
+    else:
+        callback(leads, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -400,7 +438,7 @@ def scrape_leads(category_input, area_input, callback):
 
 class FlatButton(tk.Label):
     """
-    A flat, fully color-controllable button built on tk.Label.
+    Flat, fully color-controllable button built on tk.Label.
     tk.Button on macOS ignores custom bg, so we use a Label instead.
     primary=True  -> gold fill, black text
     primary=False -> black fill, gold text + gold border
@@ -409,7 +447,7 @@ class FlatButton(tk.Label):
         self.command  = command
         self.primary  = primary
         self._enabled = True
-        self._fill    = GOLD    if primary else BG_BLACK
+        self._fill    = GOLD     if primary else BG_BLACK
         self._fg      = BG_BLACK if primary else GOLD
         self._hover   = GOLD_HOVER if primary else PANEL
 
@@ -420,9 +458,9 @@ class FlatButton(tk.Label):
             self.config(highlightbackground=GOLD, highlightcolor=GOLD,
                         highlightthickness=2, bd=0)
 
-        self.bind("<Enter>",         self._on_enter)
-        self.bind("<Leave>",         self._on_leave)
-        self.bind("<Button-1>",      self._on_press)
+        self.bind("<Enter>",           self._on_enter)
+        self.bind("<Leave>",           self._on_leave)
+        self.bind("<Button-1>",        self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
 
     def _on_enter(self, _e):
@@ -451,7 +489,6 @@ class FlatButton(tk.Label):
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Columns shown in the table and exported to CSV
 COLUMNS = [
     ("name",    "Business Name",   200),
     ("phone",   "Phone",           130),
@@ -469,10 +506,12 @@ class LeadScraperApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("LM Digital Scaling — Lead Scraper")
-        self.geometry("1200x740")
-        self.minsize(960, 580)
+        self.geometry("1200x800")
+        self.minsize(960, 620)
         self.configure(bg=BG_BLACK)
         self.leads = []
+        self._presets_visible = False
+        self._preset_vars = {}   # city_name → tk.BooleanVar
         self._init_styles()
         self._build_ui()
 
@@ -513,7 +552,7 @@ class LeadScraperApp(tk.Tk):
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
-        # Header
+        # ── Header ────────────────────────────────────────────────────────────
         hdr = tk.Frame(self, bg=BG_BLACK, pady=16, padx=24)
         hdr.pack(fill="x")
 
@@ -533,50 +572,101 @@ class LeadScraperApp(tk.Tk):
 
         tk.Frame(self, bg=GOLD, height=2).pack(fill="x")
 
-        # Search bar
+        # ── Search panel ──────────────────────────────────────────────────────
         sf = tk.Frame(self, bg=BG_BLACK, padx=24, pady=16)
         sf.pack(fill="x")
 
-        tk.Label(sf, text="Business Type", font=(UI_FONT, 10, "bold"),
-                 bg=BG_BLACK, fg=GRAY).grid(row=0, column=0, sticky="w")
+        top = tk.Frame(sf, bg=BG_BLACK)
+        top.pack(fill="x")
+
+        # Category column
+        cat_col = tk.Frame(top, bg=BG_BLACK)
+        cat_col.pack(side="left", padx=(0, 16), anchor="n")
+        tk.Label(cat_col, text="Business Type",
+                 font=(UI_FONT, 10, "bold"), bg=BG_BLACK, fg=GRAY).pack(anchor="w")
         self.category_var = tk.StringVar()
-        ce = ttk.Entry(sf, textvariable=self.category_var, width=20,
+        ce = ttk.Entry(cat_col, textvariable=self.category_var, width=20,
                        font=(UI_FONT, 12), style="Dark.TEntry")
-        ce.grid(row=1, column=0, padx=(0, 16), sticky="w")
+        ce.pack(anchor="w")
         ce.insert(0, "landscaper")
 
-        tk.Label(sf, text="City / Area", font=(UI_FONT, 10, "bold"),
-                 bg=BG_BLACK, fg=GRAY).grid(row=0, column=1, sticky="w")
-        self.area_var = tk.StringVar()
-        ae = ttk.Entry(sf, textvariable=self.area_var, width=24,
-                       font=(UI_FONT, 12), style="Dark.TEntry")
-        ae.grid(row=1, column=1, padx=(0, 16), sticky="w")
-        ae.insert(0, "Rockville, MD")
+        # Area column (multi-line text widget)
+        area_col = tk.Frame(top, bg=BG_BLACK)
+        area_col.pack(side="left", padx=(0, 16), anchor="n", fill="x", expand=True)
+        tk.Label(area_col,
+                 text="Areas to Search  (one per line — e.g. Rockville, MD)",
+                 font=(UI_FONT, 10, "bold"), bg=BG_BLACK, fg=GRAY).pack(anchor="w")
 
-        self.search_btn = FlatButton(sf, "Search", self._start_search, primary=True)
-        self.search_btn.grid(row=1, column=2, padx=(0, 12))
+        txt_border = tk.Frame(area_col, bg="#333333", bd=0,
+                              highlightbackground="#444444", highlightthickness=1)
+        txt_border.pack(fill="x", anchor="w")
+        self.area_text = tk.Text(
+            txt_border, height=4, width=40,
+            bg=PANEL, fg=WHITE, insertbackground=GOLD,
+            font=(UI_FONT, 12), relief="flat", bd=6,
+            wrap="none", undo=True,
+            selectbackground=GOLD, selectforeground=BG_BLACK,
+        )
+        self.area_text.pack(fill="x")
+        self.area_text.insert("1.0", "Rockville, MD")
 
-        self.export_btn = FlatButton(sf, "Export to CSV", self._export_csv, primary=False)
-        self.export_btn.grid(row=1, column=3)
+        # Bind focus highlight to match the ttk entry feel
+        self.area_text.bind("<FocusIn>",
+            lambda e: txt_border.config(highlightbackground=GOLD))
+        self.area_text.bind("<FocusOut>",
+            lambda e: txt_border.config(highlightbackground="#444444"))
+
+        # Button column
+        btn_col = tk.Frame(top, bg=BG_BLACK)
+        btn_col.pack(side="left", anchor="n")
+        # Spacer to vertically align buttons with the text widget (label height + padding)
+        tk.Label(btn_col, text="", bg=BG_BLACK, font=(UI_FONT, 10)).pack()
+        self.search_btn = FlatButton(btn_col, "  Search  ", self._start_search,
+                                     primary=True)
+        self.search_btn.pack(pady=(0, 8))
+        self.export_btn = FlatButton(btn_col, "Export CSV", self._export_csv,
+                                     primary=False)
+        self.export_btn.pack()
         self.export_btn.set_enabled(False)
 
-        tk.Label(sf,
-                 text="Examples — Type:  landscaper · junk removal · plumber · roofer · electrician"
-                      "    |    Area:  Rockville, MD · Silver Spring, MD · Alexandria, VA",
-                 font=(UI_FONT, 9), fg=GRAY, bg=BG_BLACK
-                 ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        tk.Label(sf,
-                 text="Tip: Double-click any row to Google the business · Right-click for Google Maps",
-                 font=(UI_FONT, 9, "italic"), fg=GOLD, bg=BG_BLACK
-                 ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        # ── DMV Presets panel ────────────────────────────────────────────────
+        presets_toggle_row = tk.Frame(sf, bg=BG_BLACK)
+        presets_toggle_row.pack(fill="x", pady=(10, 0))
 
-        # Status bar
+        self._presets_toggle_lbl = tk.Label(
+            presets_toggle_row,
+            text="▶  DMV City Presets  (click to expand)",
+            font=(UI_FONT, 10, "bold"), fg=GOLD, bg=BG_BLACK,
+            cursor="hand2",
+        )
+        self._presets_toggle_lbl.pack(side="left")
+        self._presets_toggle_lbl.bind("<Button-1>", lambda e: self._toggle_presets())
+
+        self._presets_frame = tk.Frame(sf, bg=PANEL, padx=16, pady=12)
+        self._build_presets_panel()
+
+        # ── Examples / tips ──────────────────────────────────────────────────
+        tk.Label(
+            sf,
+            text=("Examples — Type:  landscaper · junk removal · plumber · "
+                  "roofer · electrician    |    Area:  Rockville, MD · "
+                  "Silver Spring, MD · Alexandria, VA"),
+            font=(UI_FONT, 9), fg=GRAY, bg=BG_BLACK,
+        ).pack(anchor="w", pady=(12, 0))
+        tk.Label(
+            sf,
+            text=("Tip: Double-click any row to Google the business · "
+                  "Right-click for Google Maps"),
+            font=(UI_FONT, 9, "italic"), fg=GOLD, bg=BG_BLACK,
+        ).pack(anchor="w", pady=(2, 0))
+
+        # ── Status bar ────────────────────────────────────────────────────────
         self.status_var = tk.StringVar(
-            value="Ready. Enter a business type and area, then click Search.")
+            value="Ready. Enter a business type and area(s), then click Search.")
         tk.Label(self, textvariable=self.status_var, font=(UI_FONT, 10),
                  bg=PANEL, fg=GRAY, anchor="w", padx=24, pady=7).pack(fill="x")
 
-        # Table
+        # ── Results table ─────────────────────────────────────────────────────
         tf = tk.Frame(self, bg=BG_BLACK, padx=24, pady=10)
         tf.pack(fill="both", expand=True)
 
@@ -587,7 +677,7 @@ class LeadScraperApp(tk.Tk):
             self.tree.heading(col_id, text=heading)
             self.tree.column(col_id, width=width, minwidth=60)
 
-        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview,
+        vsb = ttk.Scrollbar(tf, orient="vertical",   command=self.tree.yview,
                             style="Dark.Vertical.TScrollbar")
         hsb = ttk.Scrollbar(tf, orient="horizontal", command=self.tree.xview,
                             style="Dark.Horizontal.TScrollbar")
@@ -598,28 +688,105 @@ class LeadScraperApp(tk.Tk):
         tf.grid_rowconfigure(0, weight=1)
         tf.grid_columnconfigure(0, weight=1)
 
-        # Row colour tags — all dark backgrounds, white text
         self.tree.tag_configure("strong", background="#1C2A10", foreground=WHITE)
         self.tree.tag_configure("good",   background=ROW_ODD,   foreground=WHITE)
         self.tree.tag_configure("verify", background="#2A2200",  foreground=WHITE)
         self.tree.tag_configure("sparse", background=ROW_EVEN,  foreground=GRAY)
 
-        # Click handlers
         self.tree.bind("<Double-1>",  self._on_double_click)
-        self.tree.bind("<Button-2>",  self._on_right_click)   # macOS two-finger
-        self.tree.bind("<Button-3>",  self._on_right_click)   # standard right-click
+        self.tree.bind("<Button-2>",  self._on_right_click)
+        self.tree.bind("<Button-3>",  self._on_right_click)
 
-        # Footer count
+        # ── Footer count ──────────────────────────────────────────────────────
         self.count_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.count_var, font=(UI_FONT, 11, "bold"),
                  bg=BG_BLACK, fg=GOLD, anchor="w", padx=24, pady=8).pack(fill="x")
 
-        self.bind("<Return>", lambda e: self._start_search())
+        # Return key triggers search (but not when typing in the area text box)
+        self.bind("<Return>", self._on_return_key)
 
-    # ── Helpers for browser actions ───────────────────────────────────────────
+    # ── Presets panel ─────────────────────────────────────────────────────────
+
+    def _build_presets_panel(self):
+        """Populate checkbox groups inside self._presets_frame."""
+        col = 0
+        for group_label, cities in DMV_PRESETS.items():
+            grp = tk.Frame(self._presets_frame, bg=PANEL, padx=4)
+            grp.grid(row=0, column=col, sticky="n", padx=(0, 24))
+
+            tk.Label(grp, text=group_label,
+                     font=(UI_FONT, 9, "bold"), bg=PANEL, fg=GOLD).pack(anchor="w",
+                                                                          pady=(0, 4))
+            for city in cities:
+                var = tk.BooleanVar(value=False)
+                self._preset_vars[city] = var
+                tk.Checkbutton(
+                    grp, text=city, variable=var,
+                    bg=PANEL, fg=WHITE,
+                    selectcolor="#333333",
+                    activebackground=PANEL, activeforeground=GOLD_HOVER,
+                    font=(UI_FONT, 10), anchor="w",
+                    highlightthickness=0, bd=0,
+                ).pack(anchor="w", pady=1)
+            col += 1
+
+        # Action buttons row
+        btn_row = tk.Frame(self._presets_frame, bg=PANEL)
+        btn_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        FlatButton(btn_row, "Load Selected Cities →", self._load_presets,
+                   primary=True).pack(side="left", padx=(0, 16))
+
+        for label, state in (("Select All", True), ("Clear All", False)):
+            lbl = tk.Label(btn_row, text=label,
+                           font=(UI_FONT, 10), fg=GOLD if state else GRAY,
+                           bg=PANEL, cursor="hand2")
+            lbl.pack(side="left", padx=(0, 12))
+            lbl.bind("<Button-1>", lambda e, s=state: self._select_all_presets(s))
+
+    def _toggle_presets(self):
+        if self._presets_visible:
+            self._presets_frame.pack_forget()
+            self._presets_toggle_lbl.config(
+                text="▶  DMV City Presets  (click to expand)")
+            self._presets_visible = False
+        else:
+            self._presets_frame.pack(fill="x", pady=(6, 0))
+            self._presets_toggle_lbl.config(
+                text="▼  DMV City Presets  (click to collapse)")
+            self._presets_visible = True
+
+    def _select_all_presets(self, value):
+        for var in self._preset_vars.values():
+            var.set(value)
+
+    def _load_presets(self):
+        selected = [city for city, var in self._preset_vars.items() if var.get()]
+        if not selected:
+            messagebox.showwarning(
+                "No Cities Selected",
+                "Check at least one city in the DMV Presets panel, then click Load.")
+            return
+        self.area_text.delete("1.0", "end")
+        self.area_text.insert("1.0", "\n".join(selected))
+
+    # ── Area parsing ──────────────────────────────────────────────────────────
+
+    def _parse_areas(self):
+        """Return a list of area strings from the multi-line text widget."""
+        raw = self.area_text.get("1.0", "end").strip()
+        areas = [line.strip() for line in raw.splitlines() if line.strip()]
+        return areas
+
+    # ── Click handlers ────────────────────────────────────────────────────────
+
+    def _on_return_key(self, event):
+        # Don't trigger search when the user presses Enter inside the text area
+        if event.widget is self.area_text:
+            return
+        self._start_search()
 
     def _get_selected_lead(self, event=None):
-        """Return the lead dict for the currently selected (or clicked) row."""
         if event:
             row_id = self.tree.identify_row(event.y)
             if row_id:
@@ -636,7 +803,6 @@ class LeadScraperApp(tk.Tk):
         lead = self._get_selected_lead(event)
         if not lead:
             return
-        # Open a Google search for "<Business Name> <city>" in the default browser
         query = f'{lead["name"]} {lead["city_hint"]}'
         url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
         webbrowser.open(url)
@@ -645,14 +811,14 @@ class LeadScraperApp(tk.Tk):
         lead = self._get_selected_lead(event)
         if not lead:
             return
-        # Build a context menu
         menu = tk.Menu(self, tearoff=0, bg=PANEL, fg=WHITE,
                        activebackground=GOLD, activeforeground=BG_BLACK,
                        font=(UI_FONT, 11))
 
-        google_q  = urllib.parse.quote(f'{lead["name"]} {lead["city_hint"]}')
-        maps_q    = urllib.parse.quote(
-            f'{lead["name"]} {lead["address"] if lead["address"] != "—" else lead["city_hint"]}')
+        google_q = urllib.parse.quote(f'{lead["name"]} {lead["city_hint"]}')
+        maps_q   = urllib.parse.quote(
+            f'{lead["name"]} '
+            f'{lead["address"] if lead["address"] != "—" else lead["city_hint"]}')
 
         menu.add_command(
             label="Google Search  (verify website exists)",
@@ -685,10 +851,11 @@ class LeadScraperApp(tk.Tk):
         if not self.search_btn._enabled:
             return
         category = self.category_var.get().strip()
-        area     = self.area_var.get().strip()
-        if not category or not area:
-            messagebox.showwarning("Missing Info",
-                                   "Please enter both a business type and a city/area.")
+        areas    = self._parse_areas()
+        if not category or not areas:
+            messagebox.showwarning(
+                "Missing Info",
+                "Please enter a business type and at least one area.")
             return
 
         for row in self.tree.get_children():
@@ -698,13 +865,24 @@ class LeadScraperApp(tk.Tk):
         self.count_var.set("")
         self.search_btn.set_enabled(False)
         self.search_btn.set_text("Searching…")
+
+        n      = len(areas)
+        plural = "areas" if n > 1 else "area"
         self.status_var.set(
-            f"Searching for '{category}' in '{area}' — this may take 10–30 seconds…")
+            f"Starting batch search — '{category}' across {n} {plural}…")
         self.update_idletasks()
 
-        threading.Thread(target=scrape_leads,
-                         args=(category, area, self._on_results),
-                         daemon=True).start()
+        def _progress(area_name, idx, total):
+            msg = (f"Searching {area_name}  ({idx} of {total})  —  "
+                   "querying OpenStreetMap…")
+            self.after(0, lambda: self.status_var.set(msg))
+
+        threading.Thread(
+            target=scrape_leads,
+            args=(category, areas, self._on_results),
+            kwargs={"progress_callback": _progress},
+            daemon=True,
+        ).start()
 
     def _on_results(self, leads, error):
         self.after(0, lambda: self._display_results(leads, error))
@@ -722,7 +900,8 @@ class LeadScraperApp(tk.Tk):
 
         if not leads:
             self.status_var.set(
-                "Search complete. No leads found — try a different category or broader area.")
+                "Search complete. No leads found — "
+                "try a different category or broader area.")
             self.count_var.set("0 leads found.")
             return
 
@@ -740,8 +919,9 @@ class LeadScraperApp(tk.Tk):
         self.export_btn.set_enabled(True)
         self.status_var.set(
             "Done!  Double-click a row to Google it · Right-click for more options")
+        n = len(leads)
         self.count_var.set(
-            f"{len(leads)} lead{'s' if len(leads) != 1 else ''} found — "
+            f"{n} lead{'s' if n != 1 else ''} found — "
             "sorted by lead quality · businesses with NO website")
 
     # ── CSV export ────────────────────────────────────────────────────────────
